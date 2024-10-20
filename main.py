@@ -86,15 +86,8 @@ async def main_process(file_path: str) -> bool:
     source_id = uuid.uuid4().hex
     documents = DocumentLoader.load_pdf(file_path)
 
-    # Extract Contract Agreement
-    result = await extract_contract_agreement(documents)
-    data = json.loads(result)
-
-    for document in documents:  # filterに使用する値を追加
+    for document in documents:
         document.metadata["source"] = source_id
-        document.metadata["Title"] = data.get("title", "")
-        document.metadata["PartyA"] = data.get("PartyA", {}).get("name", "")
-        document.metadata["PartyB"] = data.get("PartyB", {}).get("name", "")
 
     # 序文及び締結文を結合して、Chroma("contract_agreement")に追加する。
     contract_agreement_document = Document(page_content="")
@@ -290,18 +283,8 @@ class Chains:
         return chain
 
 
-# Step2. Extract Contarct Agreement FIXME
-async def extract_contract_agreement(documents: list[str]) -> dict:
-    contract_text = ""
-    for document in documents:
-        if document.metadata["Heading"] in ["premable", "signature"]:
-            contract_text += document.page_content + "\n\n"
-
-    chain = Chains.structured_output_chain(
-        "Extract the contract agreement information.", ContractAgreement
-    )
-    result = await chain.ainvoke(contract_text)
-    return result.json()
+# Step2. Extract Contarct Agreement
+pass
 
 
 # Step3 Chroma
