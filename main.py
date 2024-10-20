@@ -129,9 +129,9 @@ def timer(func):
 
 async def main_processes() -> bool:
     tasks = []
-    # while pdf_file_urls:  # FIXME 提出前に戻す
-    #     file_path = pdf_file_urls.pop(0)
-    #     tasks.append(main_process(file_path))
+    while pdf_file_urls:  # FIXME 提出前に戻す
+        file_path = pdf_file_urls.pop(0)
+        tasks.append(main_process(file_path))
     results = await asyncio.gather(*tasks)
     return all(results)
 
@@ -152,20 +152,29 @@ async def main_process(file_path: str) -> bool:
         document.metadata["PartyA"] = data.get("PartyA", {}).get("name", "")
         document.metadata["PartyB"] = data.get("PartyB", {}).get("name", "")
 
-    # Add Chroma
-    ids = [f"{source_id}_{i}" for i in range(len(documents))]
-    ChromaManager("article").add_documents(documents, ids=ids)
-
-    document = Document(
-        page_content=result,
-        metadata={
-            "source": source_id,
-            "Title": data.get("title", ""),
-            "PartyA": data.get("PartyA", {}).get("name", ""),
-            "PartyB": data.get("PartyB", {}).get("name", ""),
-        },
+    # 序文及び締結文をChroma("contract_agreement")に追加する。
+    contract_agreement_documents = []
+    for document in documents:
+        if document.metadata["Heading"] in ["premable", "signature"]:
+            contract_agreement_documents.append(document)
+    result_ids = ChromaManager("contract_agreement").vector_store.add_documents(
+        contract_agreement_documents
     )
-    ChromaManager("contract_agreement").add_documents([document], ids=[source_id])
+    print(
+        f"documents added to chroma 'contract_agreement' {len(result_ids)} / {len(contract_agreement_documents)}."
+    )
+
+    # 序文と締結文を除去して、条文及び別紙のみをChroma("article")に追加する。
+    documents = [
+        doc for doc in documents if doc.metadata["Heading"] not in ["premable", "signature"]
+    ]
+    ids = []
+    for index, document in enumerate(documents):
+        article_number = document.metadata.get("article_number", f"attachment{index + 1}")  # HACK
+        ids.append(f"{source_id}_{article_number}")
+    result_ids = ChromaManager("article").vector_store.add_documents(documents, ids=ids)
+    print(f"documents added to chroma 'article'  {len(result_ids)} / {len(documents)}.")
+
     return True
 
 
@@ -176,10 +185,14 @@ class DocumentLoader:
 
     @classmethod
     def load_pdf(cls, path: str) -> list[Document]:
-        separators = [f"\n+{cls.ARTICLE_SEPARATOR}", f"\n+{cls.ATTACHMENT_SEPARATOR}\n+"]
+        separators = [
+            f"\n+{cls.ARTICLE_SEPARATOR}",
+            f"\n+{cls.ATTACHMENT_SEPARATOR}\n+",
+            "\n+（以下余白）\n+",
+        ]
 
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=100,
+            chunk_size=50,
             chunk_overlap=0,
             separators=separators,
             is_separator_regex=True,
@@ -212,20 +225,24 @@ class DocumentLoader:
 
         # 別紙を結合する。
         if attachment_indices:
-            DocumentLoader._combine_attachments(documents, attachment_indices)
+            documents = DocumentLoader._combine_attachments(documents, attachment_indices)
 
         # 本文から、各条文のタイトル、条番号を抜き出す。
-        main_body_range = (0, attachment_indices[0] - 1 if attachment_indices else len(documents))
+        main_body_range = (
+            0,
+            attachment_indices[0] - 1 if attachment_indices else len(documents) - 1,
+        )
         for document in documents[: main_body_range[1]]:
 
             document.metadata["Heading"] = DocumentLoader._extract_article_title(
                 document.page_content
             )
-            article_numbers = DocumentLoader._extract_article_numbers(document.page_content)
-            if article_numbers:
+
+            if bool(re.match(rf"{cls.ARTICLE_SEPARATOR}", document.page_content)):
+                article_numbers = DocumentLoader._extract_article_numbers(document.page_content)
                 document.metadata["article_number"] = article_numbers[0]
-                if document.metadata["Heading"] != "存続条項":
-                    # 存続条項は関連条文を呼び出すメリットが低いため、除外
+                if len(article_numbers) < 5:
+                    # HACK 存続/残存条項/規定の場合、関連条文が多いため除外
                     document.metadata["related_article_number"] = ",".join(article_numbers[1:])
 
         # Headingが取得できていない場合、一つ前の条文に結合する。
@@ -234,6 +251,14 @@ class DocumentLoader:
             if not document.metadata.get("Heading"):
                 documents[index - 1].page_content += document.page_content
                 documents.pop(index)
+
+        # HACK indexとarticle_numberの整合性を取る (存続条項が結合されないパターンへの対応)
+        for index, document in enumerate(documents):
+            if document.metadata.get("article_number"):
+                if document.metadata["article_number"] != str(index):
+                    documents[index - 1].page_content += document.page_content
+                    documents.pop(index)
+                    break
 
         # article_numberのない本文を、序文及び締結文に分類。
         start_article = False
@@ -298,13 +323,14 @@ class DocumentLoader:
             return zenkaku_num.translate(str.maketrans("０１２３４５６７８９", "0123456789"))
 
         match_nums = []  # []の場合は、第十条等で、article_numberが取得できない場合
-        match_texts = re.findall(r"第\s*([０-９0-9]+)\s*条", text)
+        match_texts = re.findall(r"(?<!法)第\s*([０-９0-9]+)\s*条", text)
         if match_texts:
             match_nums = [int(fullwidth_to_halfwidth(num)) for num in match_texts]
 
             match_text = re.search("前条", text)
             if match_text:
                 match_nums.append(match_nums[0] - 1)
+
         return list(map(str, match_nums))
 
 
@@ -349,10 +375,6 @@ class ChromaManager:
             collection_metadata={"hnsw:space": "cosine"},
             persist_directory="./chroma",  # FIXME 提出前に除去
         )
-
-    def add_documents(self, documents: list[Document], ids: list[str]) -> list[str]:
-        ids = self.vector_store.add_documents(documents, ids=ids)
-        print(f"documents added to chroma {len(ids)} / {len(documents)}.")
 
     def query(
         self, query: str, filter: dict = {}, k: int = 4, threshold=0.6
@@ -455,7 +477,7 @@ def rag_implementation(question: str) -> str:
     chain = Chains.base_chain(
         f"Answer the Question.\n\nHere is the reference document.\n\n{retrieved_text}"
     )
-    answer = chain.invoke
+    answer = chain.invoke(question)
     print(answer)
     return answer
 
