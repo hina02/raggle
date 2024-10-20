@@ -42,15 +42,6 @@ pdf_file_urls = [
 # この関数を編集して、あなたの RAG パイプラインを実装してください。
 # !!! 注意 !!!: デバッグ過程は標準出力に出力しないでください。
 # ==============================================================================
-Queries = [
-    "2023年の複数の業務委託契約の各委託料の金額を比較してください。",
-    "ソフトウェア開発業務委託契約について、委託料の金額はいくらですか？",
-    "グラフィックデザイン制作業務委託契約について、受託者はいつまでに仕様書を作成して委託者の承諾を得る必要がありますか？",
-    "コールセンター業務委託契約における請求書の発行プロセスについて、締め日と発行期限を具体的に説明してください。",
-    "フューチャービルディング株式会社との契約書において、第3条第1項にはどのような内容が記載されていますか？",
-]
-
-
 # Schema
 class Article(BaseModel):  # collection1
     article_number: int | None
@@ -76,11 +67,12 @@ class ContractAgreement(BaseModel):  # collection2
 class Category(BaseModel):
     contract_agreement: str
     article: str
+    article_number: str
 
 
 async def main_processes() -> bool:
     tasks = []
-    while pdf_file_urls:  # FIXME 提出前に戻す
+    while pdf_file_urls:
         file_path = pdf_file_urls.pop(0)
         tasks.append(main_process(file_path))
     results = await asyncio.gather(*tasks)
@@ -112,7 +104,6 @@ async def main_process(file_path: str) -> bool:
     result_ids = ChromaManager("contract_agreement").vector_store.add_documents(
         [contract_agreement_document]
     )
-    print(f"documents added to chroma 'contract_agreement' {len(result_ids)} / 1.")
 
     # 序文と締結文を除去して、条文及び別紙のみをChroma("article")に追加する。
     documents = [
@@ -123,7 +114,6 @@ async def main_process(file_path: str) -> bool:
         article_number = document.metadata.get("article_number", f"attachment{index + 1}")  # HACK
         ids.append(f"{source_id}_{article_number}")
     result_ids = ChromaManager("article").vector_store.add_documents(documents, ids=ids)
-    print(f"documents added to chroma 'article'  {len(result_ids)} / {len(documents)}.")
 
     return True
 
@@ -319,22 +309,25 @@ class ChromaManager:
             collection_name=collection_name,
             embedding_function=self.embeddings,
             collection_metadata={"hnsw:space": "cosine"},
-            persist_directory="./chroma",  # FIXME 提出前に除去
         )
 
     def query(
-        self, query: str, filter: dict = {}, k: int = 4, threshold=0.6
+        self, query: str, filter: dict = {}, k: int = 4, threshold=0.7
     ) -> list[tuple[Document, float]]:
         results = self.vector_store.similarity_search_by_vector_with_relevance_scores(
             embedding=self.embeddings.embed_query(query),
             k=k,
             filter=filter,
-            # where_document={"$contains": {"text": "hello"}},
+            # where_document={"$contains": {"text": "hello"}},  TODO Sudachi + where 検討
         )
         results = [result[0] for result in results if result[1] <= threshold]
-
-        # results = self.vector_store.max_marginal_relevance_search_by_vector
         return results
+
+    def get(self, where: dict = {}, ids: list[str] = []) -> list[Document]:
+        get_results = self.vector_store.get(ids=ids, where=where)
+        contents = get_results["documents"]
+        documents = [Document(page_content=content) for content in contents]
+        return documents
 
 
 # Step4 Rephrase（質問の分解）
@@ -364,7 +357,8 @@ REPHRASE_PROMPT = """
     JSON output format:
     {{
         "contract_agreement": "question",
-        "article": "question"
+        "article": "question",
+        "article_number": "comma separated article numbers if issued"
     }}
     """
 
@@ -379,6 +373,7 @@ def rag_implementation(question: str) -> str:
         questions.contract_agreement if questions.contract_agreement else question
     )
     article_query = questions.article if questions.article else question
+    article_numbers = questions.article_number.split(",") if questions.article_number else []
 
     chroma = ChromaManager("contract_agreement")
     threshold = 0.6
@@ -394,7 +389,17 @@ def rag_implementation(question: str) -> str:
     final_results = []
     for source_result in contract_agreement_results:
         source = source_result.metadata["source"]
-        article_results = chroma.query(query=article_query, filter={"source": source})
+        if article_numbers:
+            article_results = chroma.get(
+                where={
+                    "$and": [
+                        {"source": source},
+                        {"article_number": {"$in": article_numbers}},
+                    ]
+                },
+            )
+        else:
+            article_results = chroma.query(query=article_query, filter={"source": source}, k=6)
 
         related_articles = []
         for result in article_results:
@@ -402,10 +407,9 @@ def rag_implementation(question: str) -> str:
             if related_article_numbers_str:
                 related_article_numbers = related_article_numbers_str.split(",")
                 ids = [f"{source}_{number}" for number in related_article_numbers]
-                get_results = chroma.vector_store.get(ids=ids)
-                documents = get_results["documents"]
-                for document in documents:
-                    related_articles.append(Document(page_content=document))
+                get_documents = chroma.get(ids=ids)
+                for document in get_documents:
+                    related_articles.append(document)
         article_results.extend(related_articles)
         final_results.append({"source_result": source_result, "article_results": article_results})
 
@@ -423,11 +427,8 @@ def rag_implementation(question: str) -> str:
         f"Answer the Question.\n\nHere is the reference document.\n\n{retrieved_text}"
     )
     answer = chain.invoke(question)
-    print(answer.content)
     return answer.content
 
-
-rag_implementation(Queries[0])
 
 # ==============================================================================
 
@@ -444,13 +445,13 @@ def main(question: str):
     print(json.dumps(output))
 
 
-# if __name__ == "__main__":
-#     load_dotenv()
+if __name__ == "__main__":
+    load_dotenv()
 
-#     if len(sys.argv) > 1:
-#         question = sys.argv[1]
-#         main(question)
-#     else:
-#         print("Please provide a question as a command-line argument.")
-#         sys.exit(1)
+    if len(sys.argv) > 1:
+        question = sys.argv[1]
+        main(question)
+    else:
+        print("Please provide a question as a command-line argument.")
+        sys.exit(1)
 # ==============================================================================
