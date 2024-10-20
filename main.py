@@ -68,6 +68,7 @@ class Category(BaseModel):
     contract_agreement: str
     article: str
     article_number: str
+    is_multiple: bool
 
 
 async def main_processes() -> bool:
@@ -101,9 +102,7 @@ async def main_process(file_path: str) -> bool:
         if document.metadata["Heading"] in ["premable", "signature"]:
             contract_agreement_document.page_content += document.page_content + "\n\n"
             contract_agreement_document.metadata = document.metadata
-    result_ids = ChromaManager("contract_agreement").vector_store.add_documents(
-        [contract_agreement_document]
-    )
+    ChromaManager("contract_agreement").vector_store.add_documents([contract_agreement_document])
 
     # 序文と締結文を除去して、条文及び別紙のみをChroma("article")に追加する。
     documents = [
@@ -113,7 +112,7 @@ async def main_process(file_path: str) -> bool:
     for index, document in enumerate(documents):
         article_number = document.metadata.get("article_number", f"attachment{index + 1}")  # HACK
         ids.append(f"{source_id}_{article_number}")
-    result_ids = ChromaManager("article").vector_store.add_documents(documents, ids=ids)
+    ChromaManager("article").vector_store.add_documents(documents, ids=ids)
 
     return True
 
@@ -312,7 +311,11 @@ class ChromaManager:
         )
 
     def query(
-        self, query: str, filter: dict = {}, k: int = 4, threshold=0.7
+        self,
+        query: str,
+        filter: dict = {},
+        k: int = 4,
+        threshold=0.7,  # articleのような長文では、目的文書が0.6～0.7で検出されることもあるため。
     ) -> list[tuple[Document, float]]:
         results = self.vector_store.similarity_search_by_vector_with_relevance_scores(
             embedding=self.embeddings.embed_query(query),
@@ -335,6 +338,8 @@ REPHRASE_PROMPT = """
     Please separate the given question into two categories:
     Contract Agreement - questions related to the overall contract, parties involved, or agreement specifics.
     Article - questions related to specific terms or details outlined in individual articles of the contract.
+    Additionally, categorize the question:
+    - "is_multiple": Is the question about a specific contract or about multiple contracts?
 
     Here is the document properties
     class Article(BaseModel):
@@ -358,7 +363,8 @@ REPHRASE_PROMPT = """
     {{
         "contract_agreement": "question",
         "article": "question",
-        "article_number": "comma separated article numbers if issued"
+        "article_number": "comma separated article numbers if issued",
+        "is_multiple": "true" if the question concerns multiple contracts, "false" if it is specific to a single contract.
     }}
     """
 
@@ -374,14 +380,20 @@ def rag_implementation(question: str) -> str:
     )
     article_query = questions.article if questions.article else question
     article_numbers = questions.article_number.split(",") if questions.article_number else []
+    if questions.is_multiple:
+        source_k = 10
+        article_k = 3
+    else:
+        source_k = 4
+        article_k = 6
 
     chroma = ChromaManager("contract_agreement")
-    threshold = 0.6
+    threshold = 0.6  # 契約書名指定時に、目的文書が0.4～0.5に対して、その他文書が0.6～0.7になることが多いため
     contract_agreement_results = []
 
     while contract_agreement_results == [] and threshold <= 1.0:
         contract_agreement_results = chroma.query(
-            query=contract_agreement_query, threshold=threshold
+            query=contract_agreement_query, threshold=threshold, k=source_k
         )
         threshold += 0.1
 
@@ -399,7 +411,9 @@ def rag_implementation(question: str) -> str:
                 },
             )
         else:
-            article_results = chroma.query(query=article_query, filter={"source": source}, k=6)
+            article_results = chroma.query(
+                query=article_query, filter={"source": source}, k=article_k
+            )
 
         related_articles = []
         for result in article_results:
