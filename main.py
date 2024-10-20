@@ -42,17 +42,8 @@ pdf_file_urls = [
 # この関数を編集して、あなたの RAG パイプラインを実装してください。
 # !!! 注意 !!!: デバッグ過程は標準出力に出力しないでください。
 # ==============================================================================
-KEYWORDS = []  # from Sudachi, to hybrid search(vetor and BM25) in chroma
-
-# リクエスト5回制限のため、Batch API を使用する。
-# ①　テキスト変換（代名詞、年月日） : 時間かかるなら没か。
-# ②　Embedding
-# ③　クエリ変換
-# ④　ReRank
-# ⑤　結果出力
-
 Queries = [
-    "2023年の複数の業務委託契約の各委託料の金額を比較してください。"
+    "2023年の複数の業務委託契約の各委託料の金額を比較してください。",
     "ソフトウェア開発業務委託契約について、委託料の金額はいくらですか？",
     "グラフィックデザイン制作業務委託契約について、受託者はいつまでに仕様書を作成して委託者の承諾を得る必要がありますか？",
     "コールセンター業務委託契約における請求書の発行プロセスについて、締め日と発行期限を具体的に説明してください。",
@@ -87,46 +78,6 @@ class Category(BaseModel):
     article: str
 
 
-# 1st LLM (analyse query [contract(type, date), party, , etc.])
-# ①　近い文書をサーチ
-# ②　サーチ文書をもとに、以下の情報を確定させる。
-
-# Q. 〇〇会社の2024年の代理契約書において、第3条第1項にはどのような内容が記載されていますか？
-# A. party: 〇〇会社, title: 代理契約書,  created_at: 2024 > party, titleでfilter
-# A. Heading: , article_number: 3,
-# Article検索で完全一致させるのは怖いので、filterにtitleの候補を複数入れる形で
-Prompt = """
-
-{"contract_agreement":
- "party": None,
- "article_number": None,   options = ["定義", "]
- }
-"""
-
-
-# common utils
-def atimer(func):
-    async def wrapper(*args, **kwargs):
-        start_time = time.time()
-        result = await func(*args, **kwargs)
-        end_time = time.time()
-        print(f"{func.__name__} Time: {round(end_time - start_time, 5)} seconds")
-        return result
-
-    return wrapper
-
-
-def timer(func):
-    def wrapper(*args, **kwargs):
-        start_time = time.time()
-        result = func(*args, **kwargs)
-        end_time = time.time()
-        print(f"{func.__name__} Time: {round(end_time - start_time, 5)} seconds")
-        return result
-
-    return wrapper
-
-
 async def main_processes() -> bool:
     tasks = []
     while pdf_file_urls:  # FIXME 提出前に戻す
@@ -152,17 +103,16 @@ async def main_process(file_path: str) -> bool:
         document.metadata["PartyA"] = data.get("PartyA", {}).get("name", "")
         document.metadata["PartyB"] = data.get("PartyB", {}).get("name", "")
 
-    # 序文及び締結文をChroma("contract_agreement")に追加する。
-    contract_agreement_documents = []
+    # 序文及び締結文を結合して、Chroma("contract_agreement")に追加する。
+    contract_agreement_document = Document(page_content="")
     for document in documents:
         if document.metadata["Heading"] in ["premable", "signature"]:
-            contract_agreement_documents.append(document)
+            contract_agreement_document.page_content += document.page_content + "\n\n"
+            contract_agreement_document.metadata = document.metadata
     result_ids = ChromaManager("contract_agreement").vector_store.add_documents(
-        contract_agreement_documents
+        [contract_agreement_document]
     )
-    print(
-        f"documents added to chroma 'contract_agreement' {len(result_ids)} / {len(contract_agreement_documents)}."
-    )
+    print(f"documents added to chroma 'contract_agreement' {len(result_ids)} / 1.")
 
     # 序文と締結文を除去して、条文及び別紙のみをChroma("article")に追加する。
     documents = [
@@ -198,8 +148,7 @@ class DocumentLoader:
             is_separator_regex=True,
         )
 
-        # pdf_loader = PyPDFLoader(file_path=path)
-        pdf_lumber_loader = PDFPlumberLoader(file_path=path)  # TODO Check
+        pdf_lumber_loader = PDFPlumberLoader(file_path=path)
         documents = pdf_lumber_loader.load_and_split(text_splitter=text_splitter)
 
         documents = DocumentLoader._preprocess_documents(documents)
@@ -274,11 +223,8 @@ class DocumentLoader:
                 else:
                     document.metadata["Heading"] = "premable"
 
-        # TODO 序文、締結文を各々結合
-
         return documents
 
-    # FIXME
     @staticmethod
     def _combine_attachments(documents: list[Document], attachment_indices: list[int]):
         attachments = []
@@ -428,8 +374,7 @@ def rag_implementation(question: str) -> str:
 
     # Step4. Rephrase and Search    TODO HEADING等を出力させるのはminiでは難しいか
     chain = Chains.structured_output_chain(REPHRASE_PROMPT, Category)
-    questions = chain.invoke(question)
-    # TODO miniでは精度が低い
+    questions = chain.invoke(question)  # TODO miniでは精度が低い
     contract_agreement_query = (
         questions.contract_agreement if questions.contract_agreement else question
     )
@@ -438,7 +383,7 @@ def rag_implementation(question: str) -> str:
     chroma = ChromaManager("contract_agreement")
     threshold = 0.6
     contract_agreement_results = []
-    #
+
     while contract_agreement_results == [] and threshold <= 1.0:
         contract_agreement_results = chroma.query(
             query=contract_agreement_query, threshold=threshold
@@ -447,8 +392,8 @@ def rag_implementation(question: str) -> str:
 
     chroma = ChromaManager("article")
     final_results = []
-    for result in contract_agreement_results:
-        source = result.metadata["source"]
+    for source_result in contract_agreement_results:
+        source = source_result.metadata["source"]
         article_results = chroma.query(query=article_query, filter={"source": source})
 
         related_articles = []
@@ -462,7 +407,7 @@ def rag_implementation(question: str) -> str:
                 for document in documents:
                     related_articles.append(Document(page_content=document))
         article_results.extend(related_articles)
-        final_results.append({"source_result": result, "article_results": article_results})
+        final_results.append({"source_result": source_result, "article_results": article_results})
 
     # Step5. Output
     retrieved_text = ""
@@ -478,8 +423,8 @@ def rag_implementation(question: str) -> str:
         f"Answer the Question.\n\nHere is the reference document.\n\n{retrieved_text}"
     )
     answer = chain.invoke(question)
-    print(answer)
-    return answer
+    print(answer.content)
+    return answer.content
 
 
 rag_implementation(Queries[0])
