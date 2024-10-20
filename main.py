@@ -99,10 +99,9 @@ async def main_process(file_path: str) -> bool:
     # 序文及び締結文を結合して、Chroma("contract_agreement")に追加する。
     contract_agreement_document = Document(page_content="")
     for document in documents:
-        if document.metadata["Heading"] in ["premable", "signature"]:
+        if document.metadata.get("Heading") in ["preamble", "signature"]:
             contract_agreement_document.page_content += document.page_content + "\n\n"
             contract_agreement_document.metadata = document.metadata
-    ChromaManager("contract_agreement").vector_store.add_documents([contract_agreement_document])
 
     # 序文と締結文を除去して、条文及び別紙のみをChroma("article")に追加する。
     documents = [
@@ -112,9 +111,14 @@ async def main_process(file_path: str) -> bool:
     for index, document in enumerate(documents):
         article_number = document.metadata.get("article_number", f"attachment{index + 1}")  # HACK
         ids.append(f"{source_id}_{article_number}")
-    ChromaManager("article").vector_store.add_documents(documents, ids=ids)
-
-    return True
+    try:
+        ChromaManager("contract_agreement").vector_store.add_documents(
+            [contract_agreement_document]
+        )
+        ChromaManager("article").vector_store.add_documents(documents, ids=ids)
+        return True
+    except Exception as e:
+        return False
 
 
 # Step1. Load PDF
@@ -372,9 +376,9 @@ REPHRASE_PROMPT = """
 def rag_implementation(question: str) -> str:
     asyncio.run(main_processes())
 
-    # Step4. Rephrase and Search    TODO HEADING等を出力させるのはminiでは難しいか
+    # Step4. Rephrase and Search    TODO HEADING等を出力させて、filter条件に使用する。
     chain = Chains.structured_output_chain(REPHRASE_PROMPT, Category)
-    questions = chain.invoke(question)  # TODO miniでは精度が低い
+    questions = chain.invoke(question)
     contract_agreement_query = (
         questions.contract_agreement if questions.contract_agreement else question
     )
