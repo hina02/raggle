@@ -1,8 +1,8 @@
 import asyncio
-import datetime
 import json
 import re
 import sys
+import time
 import uuid
 
 from dotenv import load_dotenv
@@ -22,18 +22,18 @@ from pydantic import BaseModel, Field
 # ==============================================================================
 model = "gpt-4o-mini"
 pdf_file_urls = [
-    # "https://storage.googleapis.com/gg-raggle-public/competitions/29676d73-5675-4278-b1a6-d4a9fdd0a0ba/dataset/Architectural_Design_Service_Contract.pdf",
-    # "https://storage.googleapis.com/gg-raggle-public/competitions/29676d73-5675-4278-b1a6-d4a9fdd0a0ba/dataset/Call_Center_Operation_Service_Contract.pdf",
-    # "https://storage.googleapis.com/gg-raggle-public/competitions/29676d73-5675-4278-b1a6-d4a9fdd0a0ba/dataset/Consulting_Service_Contract.pdf",
-    # "https://storage.googleapis.com/gg-raggle-public/competitions/29676d73-5675-4278-b1a6-d4a9fdd0a0ba/dataset/Content_Production_Service_Contract_(Request_Form).pdf",
-    # "https://storage.googleapis.com/gg-raggle-public/competitions/29676d73-5675-4278-b1a6-d4a9fdd0a0ba/dataset/Customer_Referral_Contract.pdf",
-    # "https://storage.googleapis.com/gg-raggle-public/competitions/29676d73-5675-4278-b1a6-d4a9fdd0a0ba/dataset/Draft_Editing_Service_Contract.pdf",
-    # "https://storage.googleapis.com/gg-raggle-public/competitions/29676d73-5675-4278-b1a6-d4a9fdd0a0ba/dataset/Graphic_Design_Production_Service_Contract.pdf",
+    "https://storage.googleapis.com/gg-raggle-public/competitions/29676d73-5675-4278-b1a6-d4a9fdd0a0ba/dataset/Architectural_Design_Service_Contract.pdf",
+    "https://storage.googleapis.com/gg-raggle-public/competitions/29676d73-5675-4278-b1a6-d4a9fdd0a0ba/dataset/Call_Center_Operation_Service_Contract.pdf",
+    "https://storage.googleapis.com/gg-raggle-public/competitions/29676d73-5675-4278-b1a6-d4a9fdd0a0ba/dataset/Consulting_Service_Contract.pdf",
+    "https://storage.googleapis.com/gg-raggle-public/competitions/29676d73-5675-4278-b1a6-d4a9fdd0a0ba/dataset/Content_Production_Service_Contract_(Request_Form).pdf",
+    "https://storage.googleapis.com/gg-raggle-public/competitions/29676d73-5675-4278-b1a6-d4a9fdd0a0ba/dataset/Customer_Referral_Contract.pdf",
+    "https://storage.googleapis.com/gg-raggle-public/competitions/29676d73-5675-4278-b1a6-d4a9fdd0a0ba/dataset/Draft_Editing_Service_Contract.pdf",
+    "https://storage.googleapis.com/gg-raggle-public/competitions/29676d73-5675-4278-b1a6-d4a9fdd0a0ba/dataset/Graphic_Design_Production_Service_Contract.pdf",
     "https://storage.googleapis.com/gg-raggle-public/competitions/29676d73-5675-4278-b1a6-d4a9fdd0a0ba/dataset/M&A_Advisory_Service_Contract_(Preparatory_Committee).pdf",
-    # "https://storage.googleapis.com/gg-raggle-public/competitions/29676d73-5675-4278-b1a6-d4a9fdd0a0ba/dataset/M&A_Intermediary_Service_Contract_SME_M&A_[Small_and_Medium_Enterprises].pdf",
-    # "https://storage.googleapis.com/gg-raggle-public/competitions/29676d73-5675-4278-b1a6-d4a9fdd0a0ba/dataset/Manufacturing_Sales_Post-Safety_Management_Contract.pdf",
-    # "https://storage.googleapis.com/gg-raggle-public/competitions/29676d73-5675-4278-b1a6-d4a9fdd0a0ba/dataset/software_development_outsourcing_contracts.pdf",
-    # "https://storage.googleapis.com/gg-raggle-public/competitions/29676d73-5675-4278-b1a6-d4a9fdd0a0ba/dataset/Technical_Verification_(PoC)_Contract.pdf",
+    "https://storage.googleapis.com/gg-raggle-public/competitions/29676d73-5675-4278-b1a6-d4a9fdd0a0ba/dataset/M&A_Intermediary_Service_Contract_SME_M&A_[Small_and_Medium_Enterprises].pdf",
+    "https://storage.googleapis.com/gg-raggle-public/competitions/29676d73-5675-4278-b1a6-d4a9fdd0a0ba/dataset/Manufacturing_Sales_Post-Safety_Management_Contract.pdf",
+    "https://storage.googleapis.com/gg-raggle-public/competitions/29676d73-5675-4278-b1a6-d4a9fdd0a0ba/dataset/software_development_outsourcing_contracts.pdf",
+    "https://storage.googleapis.com/gg-raggle-public/competitions/29676d73-5675-4278-b1a6-d4a9fdd0a0ba/dataset/Technical_Verification_(PoC)_Contract.pdf",
 ]
 # ==============================================================================
 
@@ -52,6 +52,7 @@ KEYWORDS = []  # from Sudachi, to hybrid search(vetor and BM25) in chroma
 # ⑤　結果出力
 
 Queries = [
+    "2023年の複数の業務委託契約の各委託料の金額を比較してください。"
     "ソフトウェア開発業務委託契約について、委託料の金額はいくらですか？",
     "グラフィックデザイン制作業務委託契約について、受託者はいつまでに仕様書を作成して委託者の承諾を得る必要がありますか？",
     "コールセンター業務委託契約における請求書の発行プロセスについて、締め日と発行期限を具体的に説明してください。",
@@ -81,6 +82,11 @@ class ContractAgreement(BaseModel):  # collection2
     created_at: str = Field(description="ISO 8601 format datetime")
 
 
+class Category(BaseModel):
+    contract_agreement: str
+    article: str
+
+
 # 1st LLM (analyse query [contract(type, date), party, , etc.])
 # ①　近い文書をサーチ
 # ②　サーチ文書をもとに、以下の情報を確定させる。
@@ -98,38 +104,68 @@ Prompt = """
 """
 
 
+# common utils
+def atimer(func):
+    async def wrapper(*args, **kwargs):
+        start_time = time.time()
+        result = await func(*args, **kwargs)
+        end_time = time.time()
+        print(f"{func.__name__} Time: {round(end_time - start_time, 5)} seconds")
+        return result
+
+    return wrapper
+
+
+def timer(func):
+    def wrapper(*args, **kwargs):
+        start_time = time.time()
+        result = func(*args, **kwargs)
+        end_time = time.time()
+        print(f"{func.__name__} Time: {round(end_time - start_time, 5)} seconds")
+        return result
+
+    return wrapper
+
+
 async def main_processes() -> bool:
     tasks = []
-    while pdf_file_urls:
-        file_path = pdf_file_urls.pop(0)
-        tasks.append(main_process(file_path))
+    # while pdf_file_urls:  # FIXME 提出前に戻す
+    #     file_path = pdf_file_urls.pop(0)
+    #     tasks.append(main_process(file_path))
     results = await asyncio.gather(*tasks)
     return all(results)
 
 
 async def main_process(file_path: str) -> bool:
     """5sec / file"""
-    start_time = datetime.datetime.now()
     # Load PDF
-    document_id = uuid.uuid4().hex
+    source_id = uuid.uuid4().hex
     documents = DocumentLoader.load_pdf(file_path)
 
     # Extract Contract Agreement
     result = await extract_contract_agreement(documents)
     data = json.loads(result)
+
     for document in documents:  # filterに使用する値を追加
-        document.metadata["source"] = document_id
+        document.metadata["source"] = source_id
         document.metadata["Title"] = data.get("title", "")
         document.metadata["PartyA"] = data.get("PartyA", {}).get("name", "")
         document.metadata["PartyB"] = data.get("PartyB", {}).get("name", "")
 
     # Add Chroma
-    ChromaManager("article").add_documents(documents)
+    ids = [f"{source_id}_{i}" for i in range(len(documents))]
+    ChromaManager("article").add_documents(documents, ids=ids)
 
-    document = Document(page_content=result, id=document_id)
-    ChromaManager("contract_agreement").add_documents([document])
-    end_time = datetime.datetime.now()
-    print(f"Time: {end_time - start_time}")
+    document = Document(
+        page_content=result,
+        metadata={
+            "source": source_id,
+            "Title": data.get("title", ""),
+            "PartyA": data.get("PartyA", {}).get("name", ""),
+            "PartyB": data.get("PartyB", {}).get("name", ""),
+        },
+    )
+    ChromaManager("contract_agreement").add_documents([document], ids=[source_id])
     return True
 
 
@@ -272,6 +308,23 @@ class DocumentLoader:
         return list(map(str, match_nums))
 
 
+class Chains:
+    @staticmethod
+    def base_chain(system_prompt: str, temperature: float = 0.3):
+        prompt = ChatPromptTemplate.from_messages([("system", system_prompt), ("human", "{text}")])
+        llm = ChatOpenAI(model=model, temperature=temperature)
+        chain = prompt | llm
+        return chain
+
+    @staticmethod
+    def structured_output_chain(system_prompt: str, base_model: BaseModel):
+        prompt = ChatPromptTemplate.from_messages([("system", system_prompt), ("human", "{text}")])
+        llm = ChatOpenAI(model=model, temperature=0.3)
+        structured_llm = llm.with_structured_output(base_model)
+        chain = prompt | structured_llm
+        return chain
+
+
 # Step2. Extract Contarct Agreement FIXME
 async def extract_contract_agreement(documents: list[str]) -> dict:
     contract_text = ""
@@ -279,22 +332,14 @@ async def extract_contract_agreement(documents: list[str]) -> dict:
         if document.metadata["Heading"] in ["premable", "signature"]:
             contract_text += document.page_content + "\n\n"
 
-    chain = extract_contract_chain()
+    chain = Chains.structured_output_chain(
+        "Extract the contract agreement information.", ContractAgreement
+    )
     result = await chain.ainvoke(contract_text)
     return result.json()
 
 
-def extract_contract_chain():
-    prompt = ChatPromptTemplate.from_messages(
-        [("system", "Extract the contract agreement information."), ("human", "{text}")]
-    )
-    model = ChatOpenAI(model="gpt-4o-2024-08-06", temperature=0.3)
-    structured_llm = model.with_structured_output(ContractAgreement)
-    chain = prompt | structured_llm
-    return chain
-
-
-# Chroma
+# Step3 Chroma
 class ChromaManager:
     def __init__(self, collection_name: str):
         self.embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
@@ -302,30 +347,120 @@ class ChromaManager:
             collection_name=collection_name,
             embedding_function=self.embeddings,
             collection_metadata={"hnsw:space": "cosine"},
+            persist_directory="./chroma",  # FIXME 提出前に除去
         )
 
-    def add_documents(self, documents: list[Document]) -> list[str]:
-        ids = self.vector_store.add_documents(documents)
+    def add_documents(self, documents: list[Document], ids: list[str]) -> list[str]:
+        ids = self.vector_store.add_documents(documents, ids=ids)
         print(f"documents added to chroma {len(ids)} / {len(documents)}.")
-        return ids
 
-    def query(self, query: str, filter: dict, k: int = 4) -> list[tuple[Document, float]]:
+    def query(
+        self, query: str, filter: dict = {}, k: int = 4, threshold=0.6
+    ) -> list[tuple[Document, float]]:
         results = self.vector_store.similarity_search_by_vector_with_relevance_scores(
             embedding=self.embeddings.embed_query(query),
             k=k,
             filter=filter,
             # where_document={"$contains": {"text": "hello"}},
         )
+        results = [result[0] for result in results if result[1] <= threshold]
+
         # results = self.vector_store.max_marginal_relevance_search_by_vector
-        print(results)
         return results
 
 
+# Step4 Rephrase（質問の分解）
+REPHRASE_PROMPT = """
+    Please separate the given question into two categories:
+    Contract Agreement - questions related to the overall contract, parties involved, or agreement specifics.
+    Article - questions related to specific terms or details outlined in individual articles of the contract.
+
+    Here is the document properties
+    class Article(BaseModel):
+        article_number: int
+        heading: str
+        text: str
+
+    class Party(BaseModel):
+        name: str
+        address: str
+        contact: str
+        delegate: str
+
+    class ContractAgreement(BaseModel):
+        title: str
+        PartyA: Party
+        PartyB: Party
+        created_at: str
+
+    JSON output format:
+    {{
+        "contract_agreement": "question",
+        "article": "question"
+    }}
+    """
+
+
 def rag_implementation(question: str) -> str:
-    return asyncio.run(main_processes())
+    asyncio.run(main_processes())
+
+    # Step4. Rephrase and Search    TODO HEADING等を出力させるのはminiでは難しいか
+    chain = Chains.structured_output_chain(REPHRASE_PROMPT, Category)
+    questions = chain.invoke(question)
+    # TODO miniでは精度が低い
+    contract_agreement_query = (
+        questions.contract_agreement if questions.contract_agreement else question
+    )
+    article_query = questions.article if questions.article else question
+
+    chroma = ChromaManager("contract_agreement")
+    threshold = 0.6
+    contract_agreement_results = []
+    #
+    while contract_agreement_results == [] and threshold <= 1.0:
+        contract_agreement_results = chroma.query(
+            query=contract_agreement_query, threshold=threshold
+        )
+        threshold += 0.1
+
+    chroma = ChromaManager("article")
+    final_results = []
+    for result in contract_agreement_results:
+        source = result.metadata["source"]
+        article_results = chroma.query(query=article_query, filter={"source": source})
+
+        related_articles = []
+        for result in article_results:
+            related_article_numbers_str = result.metadata.get("related_article_number", "")
+            if related_article_numbers_str:
+                related_article_numbers = related_article_numbers_str.split(",")
+                ids = [f"{source}_{number}" for number in related_article_numbers]
+                get_results = chroma.vector_store.get(ids=ids)
+                documents = get_results["documents"]
+                for document in documents:
+                    related_articles.append(Document(page_content=document))
+        article_results.extend(related_articles)
+        final_results.append({"source_result": result, "article_results": article_results})
+
+    # Step5. Output
+    retrieved_text = ""
+    for index, result in enumerate(final_results):
+        source_result = result["source_result"]
+        article_results = result["article_results"]
+        retrieved_text += f"Source{index}: {source_result.page_content}\n\n"
+        for article_result in article_results:
+            retrieved_text += f"{article_result.page_content}\n\n"
+        retrieved_text += "----------------------------------------"
+
+    chain = Chains.base_chain(
+        f"Answer the Question.\n\nHere is the reference document.\n\n{retrieved_text}"
+    )
+    answer = chain.invoke
+    print(answer)
+    return answer
 
 
-rag_implementation("")
+rag_implementation(Queries[0])
 
 # ==============================================================================
 
