@@ -1,6 +1,8 @@
 venv/*
 .env
 dataset/*
+.python-version
+uv.lock
 
 # add_settings
 image
