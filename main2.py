@@ -89,9 +89,6 @@ SOURCE_LIST = {
 COLLECTION_MAP = {}
 IMAGE_COLLECTION_MAP = {}
 
-SOURCE_LIST_STR = ""
-
-
 REPHRASE_PROMPT = """
     Compose Args for hybrid search, this function performs a hybrid search by combining vector similarity and keyword-based filtering
     to retrieve relevant documents from the specified collection.
@@ -186,15 +183,16 @@ def is_valid_source_collection(sources: list[DocumentInfo]):
 
 
 def update_source_list_str():
+    global SOURCE_LIST_STR
+    SOURCE_LIST_STR = ""
     for collection_name in SOURCE_LIST.keys():
         sources = []
-    for item in SOURCE_LIST[collection_name]:
-        sources.append(item.source)
-
-    SOURCE_LIST_STR += f"""
-    **Collection** : {collection_name}
-    Sources : {", ".join(sources)}
-    """
+        for item in SOURCE_LIST[collection_name]:
+            sources.append(item.source)
+        SOURCE_LIST_STR += f"""
+        **Collection** : {collection_name}
+        Sources : {", ".join(sources)}
+        """
 
 
 # Create Chroma Collection
@@ -346,6 +344,7 @@ async def build_collection():
     for info in document_infos:
         if info.collection_name in SOURCE_LIST:
             SOURCE_LIST[info.collection_name].append(info)
+    update_source_list_str()
 
     # create collection
     client = chromadb.Client()
@@ -401,7 +400,7 @@ def hybrid_search(
     query_keyword: str = None,
     not_contain_word: str = None,
     source: str = None,
-    top_k=20,
+    top_k=18,
 ) -> str:
     if query_keyword:
         search_dict = {"$contains": query_keyword}  # 一語のみ
@@ -499,15 +498,17 @@ def rag_implementation(question: str) -> str:
         image_paths = []
 
         # 画像コレクションがある場合、画像検索を実施
-        if IMAGE_COLLECTION_MAP[query_args.collection_name]:
+        if hasattr(IMAGE_COLLECTION_MAP, query_args.collection_name):
             image_paths = query_image_collection(
                 query_args.collection_name, query_args.vector_query_text
             )
-
         if image_paths:
             response = chat_image(client, question, image_paths)
+        else:
+            response = chat(client, question, hybrid_search_result)
 
     else:
+        hybrid_search_result = hybrid_search(**query_args.model_dump())
         response = chat(client, question, hybrid_search_result)
 
     # 戻り値として質問に対する回答を返却してください。
