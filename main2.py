@@ -495,20 +495,25 @@ def rag_implementation(question: str) -> str:
 
     # 検索結果が得られなかった場合
     if not hybrid_search_result:
-        image_paths = []
 
         # 画像コレクションがある場合、画像検索を実施
+        image_paths = []
         if hasattr(IMAGE_COLLECTION_MAP, query_args.collection_name):
             image_paths = query_image_collection(
                 query_args.collection_name, query_args.vector_query_text
             )
+
         if image_paths:
             response = chat_image(client, question, image_paths)
+
+        # 画像コレクションがなく、検索結果が得られなかった場合、メタデータフィルターを排除して再検索
         else:
+            hybrid_search_result = hybrid_search(
+                **query_args.model_dump(include={"collection_name", "vector_query_text"})
+            )
             response = chat(client, question, hybrid_search_result)
 
     else:
-        hybrid_search_result = hybrid_search(**query_args.model_dump())
         response = chat(client, question, hybrid_search_result)
 
     # 戻り値として質問に対する回答を返却してください。
