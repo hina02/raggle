@@ -9,11 +9,11 @@ from asyncio import gather
 from enum import Enum
 from urllib.parse import urlparse
 
+import chromadb
 import chromadb.utils.embedding_functions as embedding_functions
 import numpy as np
 import pymupdf
 import requests
-from chromadb.config import Settings
 from chromadb.utils.data_loaders import ImageLoader
 from chromadb.utils.embedding_functions import OpenCLIPEmbeddingFunction
 from dotenv import load_dotenv
@@ -22,8 +22,6 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 from openai import OpenAI
 from pydantic import BaseModel
-
-import chromadb
 
 # ==============================================================================
 # !!! 警告 !!!: 以下の変数を変更しないでください。
@@ -56,18 +54,18 @@ class ClassifyResult(BaseModel):
     is_valid: bool
 
 
-class DocumentInfo(BaseModel):
-    path: str
-    source: str
-    collection_name: str
-    is_valid: bool
-
-
 class PageDocument(BaseModel):
     source: str
     page: int
     text: str
     distance: float
+
+
+class DocumentInfo(BaseModel):
+    path: str
+    source: str
+    collection_name: str
+    is_valid: bool
 
 
 class QueryArgs(BaseModel):
@@ -81,62 +79,12 @@ class QueryArgs(BaseModel):
 IMAGE_DIR = "page_images"
 os.makedirs(IMAGE_DIR, exist_ok=True)
 
-VAR_DIR = "global_variables"
-os.makedirs(VAR_DIR, exist_ok=True)
 
-CHROMA_DIR = "chromadb"
-
-DEFAULT_SOURCE_LIST = {
+SOURCE_LIST = {
     "COMPANY_INFORMATION": [],
     "PRODUCT_INFORMATION": [],
     "RESEARCH_INFORMATION": [],
 }
-
-
-def save_source_list_str(data: str):
-    path = os.path.join(VAR_DIR, "source_list_str.json")
-    with open(path, "w") as f:
-        json.dump(data, f, indent=4)
-
-
-def load_source_list_str() -> str | None:
-    path = os.path.join(VAR_DIR, "source_list_str.json")
-    if not os.path.exists(path):
-        return None
-    with open(path, "r") as f:
-        data = json.load(f)
-    return data
-
-
-def save_document_infos(data: list[DocumentInfo]):
-    path = os.path.join(VAR_DIR, "document_infos.json")
-    with open(path, "w") as f:
-        json.dump([item.model_dump() for item in data], f, indent=4)
-
-
-def load_document_infos() -> list[DocumentInfo] | None:
-    path = os.path.join(VAR_DIR, "document_infos.json")
-    if not os.path.exists(path):
-        return None
-    with open(path, "r") as f:
-        return [DocumentInfo(**item) for item in json.load(f)]
-
-
-def reset_directory(directory: str):
-    for file in os.listdir(directory):
-        file_path = os.path.join(directory, file)
-        os.remove(file_path)
-
-
-def set_global_variables() -> tuple[dict, str]:
-    loaded_document_infos = load_document_infos()
-    document_infos = loaded_document_infos if loaded_document_infos else []
-
-    loaded_source_list_str = load_source_list_str()
-    source_list_str = loaded_source_list_str if loaded_source_list_str else ""
-
-    return document_infos, source_list_str
-
 
 COLLECTION_MAP = {}
 IMAGE_COLLECTION_MAP = {}
@@ -173,9 +121,9 @@ REPHRASE_PROMPT = """
 
     Example:
         ストックオプションの有無を教えてください。
-          > hybrid_search("COMPANY_INFORMATION", "ストックオプションの有無", query_keyword="ストックオプション")
+          > hybrid_search_tool("COMPANY_INFORMATION", "ストックオプションの有無", query_keyword="ストックオプション")
         どういう製品がありますか？
-          > hybrid_search("PRODUCT_INFORMATION", "製品一覧", source="〇〇社製品パンフレット")
+          > hybrid_search_tool("PRODUCT_INFORMATION", "製品一覧", source="〇〇社製品パンフレット")
 
     {}
             """
@@ -234,30 +182,23 @@ def is_valid_source_collection(sources: list[DocumentInfo]):
     return all(source.is_valid for source in sources)
 
 
-def update_source_list(document_infos: list[DocumentInfo]):
-    source_list = DEFAULT_SOURCE_LIST
-    for info in document_infos:
-        source_list[info.collection_name].append(info)
-    return source_list
-
-
-def update_source_list_str(source_list: dict) -> str:
-    source_list_str = ""
-    for collection_name in source_list.keys():
+def update_source_list_str():
+    global SOURCE_LIST_STR
+    SOURCE_LIST_STR = ""
+    for collection_name in SOURCE_LIST.keys():
         sources = []
-        for item in source_list[collection_name]:
+        for item in SOURCE_LIST[collection_name]:
             sources.append(item.source)
-        source_list_str += f"""
+        SOURCE_LIST_STR += f"""
         **Collection** : {collection_name}
         Sources : {", ".join(sources)}
         """
-    return source_list_str
 
 
 # Create Chroma Collection
 # Create MultiModal Collection  # 律速
 async def create_multimodal_collection(client, collection_name: str):
-    collection = client.get_or_create_collection(
+    collection = client.create_collection(
         name=collection_name + "_IMAGE",
         embedding_function=OpenCLIPEmbeddingFunction(),
         data_loader=ImageLoader(),
@@ -266,33 +207,33 @@ async def create_multimodal_collection(client, collection_name: str):
 
 
 # Create Collection
-def create_collection_map(client, source_list: dict):
+def create_collection_map(client):
     emb_fn = embedding_functions.OpenAIEmbeddingFunction(
         model_name="text-embedding-3-small", api_key=os.environ["OPENAI_API_KEY"]
     )
 
-    if source_list["COMPANY_INFORMATION"]:
-        COLLECTION_MAP["COMPANY_INFORMATION"] = client.get_or_create_collection(
+    if SOURCE_LIST["COMPANY_INFORMATION"]:
+        COLLECTION_MAP["COMPANY_INFORMATION"] = client.create_collection(
             name="COMPANY_INFORMATION", embedding_function=emb_fn
         )
-    if source_list["PRODUCT_INFORMATION"]:
-        COLLECTION_MAP["PRODUCT_INFORMATION"] = client.get_or_create_collection(
+    if SOURCE_LIST["PRODUCT_INFORMATION"]:
+        COLLECTION_MAP["PRODUCT_INFORMATION"] = client.create_collection(
             name="PRODUCT_INFORMATION", embedding_function=emb_fn
         )
-    if source_list["RESEARCH_INFORMATION"]:
-        COLLECTION_MAP["RESEARCH_INFORMATION"] = client.get_or_create_collection(
+    if SOURCE_LIST["RESEARCH_INFORMATION"]:
+        COLLECTION_MAP["RESEARCH_INFORMATION"] = client.create_collection(
             name="RESEARCH_INFORMATION", embedding_function=emb_fn
         )
 
 
-async def create_image_collection_map(client, source_list: dict):
-    if not is_valid_source_collection(source_list["COMPANY_INFORMATION"]):
+async def create_image_collection_map(client):
+    if not is_valid_source_collection(SOURCE_LIST["COMPANY_INFORMATION"]):
         company_image_collection = await create_multimodal_collection(client, "COMPANY_INFORMATION")
         IMAGE_COLLECTION_MAP["COMPANY_INFORMATION"] = company_image_collection
-    if not is_valid_source_collection(source_list["PRODUCT_INFORMATION"]):
+    if not is_valid_source_collection(SOURCE_LIST["PRODUCT_INFORMATION"]):
         product_image_collection = await create_multimodal_collection(client, "PRODUCT_INFORMATION")
         IMAGE_COLLECTION_MAP["PRODUCT_INFORMATION"] = product_image_collection
-    if not is_valid_source_collection(source_list["RESEARCH_INFORMATION"]):
+    if not is_valid_source_collection(SOURCE_LIST["RESEARCH_INFORMATION"]):
         research_image_collection = await create_multimodal_collection(
             client, "RESEARCH_INFORMATION"
         )
@@ -398,49 +339,21 @@ async def load_pdf(info: DocumentInfo):
 
 async def build_collection():
     paths = [download_file(url) for url in pdf_file_urls]
-    has_client_data = False
+    # classify pdf
+    document_infos = await classify_pdfs(paths)
+    for info in document_infos:
+        if info.collection_name in SOURCE_LIST:
+            SOURCE_LIST[info.collection_name].append(info)
+    update_source_list_str()
 
-    # load stored settings
-    document_infos, source_list_str = set_global_variables()
-    if document_infos and source_list_str:
-        source_list = update_source_list(document_infos)
+    # create collection
+    client = chromadb.Client()
+    create_collection_map(client)
+    await create_image_collection_map(client)
 
-        # PDFのソースが変更された場合、ChromaDBをリセット
-        past_sources = [info.source for info in document_infos]
-        current_sources = [os.path.basename(path).split(".")[0] for path in paths]
-
-        if not sorted(past_sources) == sorted(current_sources):
-            client = chromadb.PersistentClient(path=CHROMA_DIR, settings=Settings(allow_reset=True))
-            client.reset()
-            reset_directory(IMAGE_DIR)
-            reset_directory(VAR_DIR)
-            source_list = DEFAULT_SOURCE_LIST
-            source_list_str = ""
-        else:
-            has_client_data = True
-
-    if has_client_data:
-        client = chromadb.PersistentClient(path=CHROMA_DIR, settings=Settings(allow_reset=True))
-        create_collection_map(client, source_list)
-        await create_image_collection_map(client, source_list)
-
-    else:
-        # classify pdf
-        document_infos = await classify_pdfs(paths)
-        source_list = update_source_list(document_infos)
-        source_list_str = update_source_list_str(source_list)
-        save_document_infos(document_infos)
-        save_source_list_str(source_list_str)
-
-        # create collection
-        client = chromadb.PersistentClient(path=CHROMA_DIR, settings=Settings(allow_reset=True))
-        create_collection_map(client, source_list)
-        await create_image_collection_map(client, source_list)
-
-        # add pdf data to chroma
-        tasks = [load_pdf(info) for info in document_infos]
-        await gather(*tasks)
-    return source_list_str
+    # add pdf data to chroma
+    tasks = [load_pdf(info) for info in document_infos]
+    await gather(*tasks)
 
 
 # Query
@@ -525,8 +438,8 @@ def hybrid_search(
     return text
 
 
-def rephrase_query(query: str, source_list_str: str) -> QueryArgs:
-    rephrase_prompt = REPHRASE_PROMPT.format(source_list_str)
+def rephrase_query(query: str) -> QueryArgs:
+    rephrase_prompt = REPHRASE_PROMPT.format(SOURCE_LIST_STR)
     llm = ChatOpenAI(model=model, temperature=0.3)
     prompt = ChatPromptTemplate.from_messages(
         [
@@ -573,11 +486,11 @@ def rag_implementation(question: str) -> str:
         - 回答は日本語で生成してください
     """
     # build collection
-    source_list_str = asyncio.run(build_collection())
+    asyncio.run(build_collection())
 
     # query
     client = OpenAI()
-    query_args = rephrase_query(question, source_list_str)
+    query_args = rephrase_query(question)
     hybrid_search_result = hybrid_search(**query_args.model_dump())
 
     # 検索結果が得られなかった場合
