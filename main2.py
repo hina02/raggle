@@ -9,7 +9,6 @@ from asyncio import gather
 from enum import Enum
 from urllib.parse import urlparse
 
-import chromadb
 import chromadb.utils.embedding_functions as embedding_functions
 import numpy as np
 import pymupdf
@@ -22,6 +21,8 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 from openai import OpenAI
 from pydantic import BaseModel
+
+import chromadb
 
 # ==============================================================================
 # !!! 警告 !!!: 以下の変数を変更しないでください。
@@ -68,16 +69,33 @@ class DocumentInfo(BaseModel):
     is_valid: bool
 
 
-class QueryArgs(BaseModel):
+class Table(BaseModel):
+    table_name: str
+    caption: str | None
+    table_schema: str | None
+    source: str
+    page: int
+
+
+class QueryArg(BaseModel):
     collection_name: str
     vector_query_text: str
-    query_keyword: str = None
-    not_contain_word: str = None
+    query_keyword: str | None = None
     source: str = None
+
+
+class QueryArgs(BaseModel):
+    args: list[QueryArg]
+
+
+class EvalResult(BaseModel):
+    is_answerable: bool
 
 
 IMAGE_DIR = "page_images"
 os.makedirs(IMAGE_DIR, exist_ok=True)
+TABLE_IMAGE_DIR = "table_images"
+os.makedirs(TABLE_IMAGE_DIR, exist_ok=True)
 
 
 SOURCE_LIST = {
@@ -88,10 +106,11 @@ SOURCE_LIST = {
 
 COLLECTION_MAP = {}
 IMAGE_COLLECTION_MAP = {}
+TABLE_COLLECTION_MAP = {}
 
 REPHRASE_PROMPT = """
     Compose Args for hybrid search, this function performs a hybrid search by combining vector similarity and keyword-based filtering
-    to retrieve relevant documents from the specified collection.
+    to retrieve relevant documents from the specified collection. Output multiple combinations for query_keyword.
 
     Args:
         collection_name (str):
@@ -120,6 +139,9 @@ REPHRASE_PROMPT = """
         If `not_contain_word` is provided, results containing this word are excluded.
 
     Example:
+        85期のキャッシュフローは？
+          > query_keyword="キャッシュフロー"
+            query_keyword="85期"
         ストックオプションの有無を教えてください。
           > hybrid_search_tool("COMPANY_INFORMATION", "ストックオプションの有無", query_keyword="ストックオプション")
         どういう製品がありますか？
@@ -216,13 +238,22 @@ def create_collection_map(client):
         COLLECTION_MAP["COMPANY_INFORMATION"] = client.create_collection(
             name="COMPANY_INFORMATION", embedding_function=emb_fn
         )
+        TABLE_COLLECTION_MAP["COMPANY_INFORMATION"] = client.create_collection(
+            name="COMPANY_INFORMATION_TABLE", embedding_function=emb_fn
+        )
     if SOURCE_LIST["PRODUCT_INFORMATION"]:
         COLLECTION_MAP["PRODUCT_INFORMATION"] = client.create_collection(
             name="PRODUCT_INFORMATION", embedding_function=emb_fn
         )
+        TABLE_COLLECTION_MAP["PRODUCT_INFORMATION"] = client.create_collection(
+            name="PRODUCT_INFORMATION_TABLE", embedding_function=emb_fn
+        )
     if SOURCE_LIST["RESEARCH_INFORMATION"]:
         COLLECTION_MAP["RESEARCH_INFORMATION"] = client.create_collection(
             name="RESEARCH_INFORMATION", embedding_function=emb_fn
+        )
+        TABLE_COLLECTION_MAP["RESEARCH_INFORMATION"] = client.create_collection(
+            name="RESEARCH_INFORMATION_TABLE", embedding_function=emb_fn
         )
 
 
@@ -256,6 +287,25 @@ async def save_page_image(
         pix.h, pix.w, pix.n
     )  # np.array(img)と一致を確認済み
     return image_id, image_data
+
+
+async def save_table_image(
+    page: pymupdf.Page, table_id: str, dir_name: str, bbox: tuple
+) -> tuple[str, np.ndarray]:
+    try:
+        clip = pymupdf.Rect(*bbox) & page.rect
+        if clip.width <= 0 or clip.height <= 0:
+            raise ValueError("Invalid clip dimensions: width or height is zero or negative.")
+
+        zoom_factor = 2.0
+        mat = pymupdf.Matrix(zoom_factor, zoom_factor)
+
+        pix = page.get_pixmap(matrix=mat, clip=clip)
+        table_image_path = os.path.join(dir_name, f"{table_id}.png")
+        await asyncio.to_thread(pix.save, table_image_path)
+
+    except Exception:
+        pass
 
 
 async def add_pdf_image_data(
@@ -323,6 +373,108 @@ async def add_pdf_text_data(
         await process_batch(batch)
 
 
+async def add_pdf_table_data(
+    doc: pymupdf.Document, source: str, collection_name: DocumentCategory, batch_size: int = 10
+):
+    collection = TABLE_COLLECTION_MAP[collection_name]
+
+    async def extract_page_tables(num_page, page):
+        tables = await save_table(page, source, num_page)
+
+        return [
+            {
+                "id": table.table_name,
+                "text": f"table caption: {table.caption}\n\nschema: {table.table_schema}",
+                "metadata": {"source": table.source, "page": num_page + 1},
+            }
+            for table in tables
+        ]
+
+    async def process_batch(batch):
+        ids, texts, metadatas = [], [], []
+
+        for num_page, page in batch:
+            page_datas = await extract_page_tables(num_page, page)
+            for page_data in page_datas:
+                ids.append(page_data["id"])
+                texts.append(page_data["text"])
+                metadatas.append(page_data["metadata"])
+
+        if ids and texts and metadatas:
+            await asyncio.to_thread(collection.add, documents=texts, metadatas=metadatas, ids=ids)
+
+    batch = []
+    for num_page, page in enumerate(doc):
+        batch.append((num_page, page))
+
+        if len(batch) == batch_size:
+            await process_batch(batch)
+            batch = []
+
+    if batch:
+        await process_batch(batch)
+
+
+def get_caption_text(page: pymupdf.Page, table_bbox, margin=20):
+    """
+    テーブル上下のキャプションを取得する
+    table_bbox: (x0, y0, x1, y1) テーブル全体の座標 左上が原点（x0,y0）
+    """
+    x0, y0, x1, y1 = table_bbox
+    top_box = (x0, y0 - margin, x1, y0)
+    top_text = page.get_textbox(top_box)
+    bottom_box = (x0, y1, x1, y1 + margin)
+    bottom_text = page.get_textbox(bottom_box)
+    return top_text.strip(), bottom_text.strip()
+
+
+async def save_table(
+    page: pymupdf.Page, source: str, num_page: int
+) -> tuple[list[Table], list[str]]:
+    tables = page.find_tables(strategy="lines_strict").tables
+
+    table_datas = []
+    if tables:
+        for index, table in enumerate(tables):
+            # table caption
+            bbox = table.bbox
+            caption = None
+            if bbox:
+                top_caption, bottom_caption = get_caption_text(page, bbox, margin=20)
+                caption = f"{top_caption}\n\n{bottom_caption}"
+
+            # table dataframe
+            df = table.to_pandas()
+            if table.header.external:  # ヘッダーが表の外部の場合、一行目をヘッダーに置き換える
+                new_header = df.iloc[0]
+                df = df[1:]
+                df.columns = new_header
+                df.reset_index(drop=True, inplace=True)
+
+            if all(
+                col is not None and col.startswith("Col") for col in df.columns
+            ):  # ヘッダーがすべてデフォルト列名の場合、保存しない
+                continue
+
+            # テーブルはsqliteに保存せず、スクショする
+            table_id = f"{source}_{num_page}_{index}"
+            await save_table_image(page, table_id, TABLE_IMAGE_DIR, bbox)
+
+            # table schema
+            table_schema = {"columns": df.columns.tolist(), "index": df.iloc[:, 0].tolist()}
+
+            table_data = Table(
+                table_name=table_id,
+                caption=caption,
+                table_schema=json.dumps(table_schema, ensure_ascii=False, indent=2),
+                source=source,
+                page=num_page,
+            )
+            table_datas.append(table_data)
+
+    return table_datas
+
+
 async def load_pdf(info: DocumentInfo):
     pdf_path = info.path
     source = info.source
@@ -335,6 +487,7 @@ async def load_pdf(info: DocumentInfo):
         if not info.is_valid:
             await add_pdf_image_data(doc, source, collection_name)
         await add_pdf_text_data(doc, source, collection_name)
+        await add_pdf_table_data(doc, source, collection_name)
 
 
 async def build_collection():
@@ -359,19 +512,18 @@ async def build_collection():
 # Query
 
 
-def encode_image(image_path):
-    dirname = IMAGE_DIR
-    path = os.path.join(dirname, image_path)
+def encode_image(image_path: str, dir_name: str):
+    path = os.path.join(dir_name, image_path)
 
     with open(path, "rb") as image_file:
         return base64.b64encode(image_file.read()).decode("utf-8")
 
 
-def chat_image(client, text: str, image_paths: list[str]) -> str:
+def chat_image(client: OpenAI, text: str, image_paths: list[str], dir_name: str = IMAGE_DIR) -> str:
     messages = [{"role": "user", "content": [{"type": "text", "text": text}]}]
 
     for image_path in image_paths:
-        base64_image = encode_image(image_path)
+        base64_image = encode_image(image_path, dir_name)
         image_message = {
             "type": "image_url",
             "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
@@ -394,32 +546,36 @@ def query_image_collection(collection_name: str, query_text: str, top_k=4):
     return [image_path + ".png" for image_path in image_paths]
 
 
+def hybrid_search_base(
+    collection,
+    vector_query_text: str,
+    query_keyword: str = None,
+    source: str = None,
+    top_k: int = 10,
+):
+    search_dict = {"$contains": query_keyword} if query_keyword else None
+    metadata_filter = {"source": {"$eq": source}} if source else None
+
+    return collection.query(
+        query_texts=[vector_query_text],
+        n_results=top_k,
+        where=metadata_filter,  # ソースで絞り込み
+        where_document=search_dict,  # キーワードで絞り込み
+    )
+
+
 def hybrid_search(
     collection_name: str,
     vector_query_text: str,
     query_keyword: str = None,
-    not_contain_word: str = None,
     source: str = None,
-    top_k=18,
-) -> str:
-    if query_keyword:
-        search_dict = {"$contains": query_keyword}  # 一語のみ
-    elif not_contain_word:
-        search_dict = {"$not_contains": not_contain_word}
-    else:
-        search_dict = None
-
-    metadata_filter = {"source": {"$eq": source}} if source else None
-
+    top_k: int = 10,
+) -> list[PageDocument]:
     collection = COLLECTION_MAP[collection_name]
-    results = collection.query(
-        query_texts=[vector_query_text],
-        n_results=top_k,
-        where=metadata_filter,  # sourceで絞込
-        where_document=search_dict,
-    )
+    results = hybrid_search_base(collection, vector_query_text, query_keyword, source, top_k)
+
     if not results:
-        return []
+        return ""
 
     documents = [
         PageDocument(
@@ -430,12 +586,23 @@ def hybrid_search(
         )
         for i in range(len(results["documents"][0]))
     ]
-    documents = list(filter(lambda x: x.distance < 1.48, documents))
+    documents = [doc for doc in documents if doc.distance < 1.48]  # 類似度の閾値
 
-    text = ""
-    for page in documents:
-        text += f"# {page.source} Page {page.page}: \n{page.text}\n\n"
-    return text
+    return documents
+
+
+def hybrid_search_table(
+    collection_name: str,
+    vector_query_text: str,
+    query_keyword: str = None,
+    source: str = None,
+    top_k: int = 5,
+) -> list[str]:
+    collection = TABLE_COLLECTION_MAP[collection_name]
+    results = hybrid_search_base(collection, vector_query_text, query_keyword, source, top_k)
+    if not results:
+        return []
+    return results.get("ids", [])[0]
 
 
 def rephrase_query(query: str) -> QueryArgs:
@@ -452,7 +619,7 @@ def rephrase_query(query: str) -> QueryArgs:
     return structured_llm.invoke(query)
 
 
-def chat(client, text: str, retrieval_text: str) -> str:
+def chat(client: OpenAI, text: str, retrieval_text: str) -> str:
     messages = [
         {
             "role": "system",
@@ -467,6 +634,83 @@ def chat(client, text: str, retrieval_text: str) -> str:
         max_tokens=10000,
     )
     return response.choices[0].message.content
+
+
+def eval(client: OpenAI, query: str, answer: str) -> bool:
+    messages = [
+        {
+            "role": "system",
+            "content": """与えられた回答が、質問に回答していない場合は、falseを、質問に回答している場合は、trueを返してください。回答はJSONです。
+                        例
+                        質問: 在外子会社の従業員数は？\n\n回答: 在外子会社の従業員数に関する資料は見つかりませんでした。  ＞　false
+                        質問: 在外子会社の従業員数は？\n\n回答: 在外子会社の従業員数については分かりません。  ＞　false
+                        質問: 在外子会社の従業員数は？\n\n回答: 在外子会社の従業員数については答えられません。  ＞　false
+                        """,
+        },
+        {"role": "assistant", "content": f"質問: {query}\n\n回答: {answer}"},
+    ]
+    response = client.beta.chat.completions.parse(
+        model="gpt-4o-mini",
+        temperature=0.3,
+        messages=messages,
+        max_tokens=100,
+        response_format=EvalResult,
+    )
+    result = EvalResult.model_validate_json(response.choices[0].message.content)
+    return result.is_answerable
+
+
+def deduplicate_documents(retrieval_texts_list: list[list[PageDocument]]) -> str:
+    seen = set()
+    combined_text = ""
+
+    for document_list in retrieval_texts_list:
+        for page in document_list:
+            key = (page.source, page.page)
+            if key not in seen:
+                seen.add(key)
+                combined_text += f"# {page.source} Page {page.page}:\n{page.text}\n\n"
+    return combined_text
+
+
+def query(client: OpenAI, question: str, query_args: list[QueryArg]):
+    retrieval_texts_list = []
+    retrieval_tables_list = []
+    for query_arg in query_args:
+        retrieval_texts_list.append(hybrid_search(**query_arg.model_dump()))
+        retrieval_tables_list.append(hybrid_search_table(**query_arg.model_dump()))
+
+    retrieval_texts = deduplicate_documents(retrieval_texts_list)
+    retrieval_tables = []
+    for table in retrieval_tables_list:
+        retrieval_tables.extend(table)
+    table_names = list(set(retrieval_tables))
+    table_image_paths = [f"{name}.png" for name in table_names]
+
+    # 検索結果が得られなかった場合、画像検索
+    if not retrieval_texts:
+        image_paths = []
+        if IMAGE_COLLECTION_MAP.get(query_args[0].collection_name):
+            image_paths = query_image_collection(
+                query_args[0].collection_name, query_args[0].vector_query_text
+            )
+
+        if image_paths:
+            image_response = chat_image(client, question, image_paths, IMAGE_DIR)
+            return image_response
+
+        # 画像コレクションがなく、検索結果が得られなかった場合、メタデータフィルターを排除して再検索
+        else:
+            retrieval_texts = hybrid_search(
+                query_args[0].collection_name, query_args[0].vector_query_text
+            )
+            retrieval_texts = deduplicate_documents(retrieval_texts_list)
+    text_response = chat(client, question, retrieval_texts)
+    is_answerable = eval(client, question, text_response)
+    if not is_answerable:
+        return chat_image(client, question, table_image_paths, TABLE_IMAGE_DIR)
+    else:
+        return text_response
 
 
 def rag_implementation(question: str) -> str:
@@ -490,31 +734,9 @@ def rag_implementation(question: str) -> str:
 
     # query
     client = OpenAI()
-    query_args = rephrase_query(question)
-    hybrid_search_result = hybrid_search(**query_args.model_dump())
-
-    # 検索結果が得られなかった場合
-    if not hybrid_search_result:
-
-        # 画像コレクションがある場合、画像検索を実施
-        image_paths = []
-        if hasattr(IMAGE_COLLECTION_MAP, query_args.collection_name):
-            image_paths = query_image_collection(
-                query_args.collection_name, query_args.vector_query_text
-            )
-
-        if image_paths:
-            response = chat_image(client, question, image_paths)
-
-        # 画像コレクションがなく、検索結果が得られなかった場合、メタデータフィルターを排除して再検索
-        else:
-            hybrid_search_result = hybrid_search(
-                **query_args.model_dump(include={"collection_name", "vector_query_text"})
-            )
-            response = chat(client, question, hybrid_search_result)
-
-    else:
-        response = chat(client, question, hybrid_search_result)
+    response = rephrase_query(question)
+    query_args = response.args
+    response = query(client, question, query_args)
 
     # 戻り値として質問に対する回答を返却してください。
     answer = response
