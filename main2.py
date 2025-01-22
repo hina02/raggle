@@ -14,7 +14,6 @@ import numpy as np
 import pymupdf
 import requests
 from chromadb.utils.data_loaders import ImageLoader
-from chromadb.utils.embedding_functions import OpenCLIPEmbeddingFunction
 from dotenv import load_dotenv
 from langchain import callbacks
 from langchain_core.prompts import ChatPromptTemplate
@@ -260,12 +259,19 @@ def create_collection_map(client):
 async def save_page_image(page: pymupdf.Page, num_page: int, source: str, dir_name: str) -> str:
     zoom_factor = 2.0
     mat = pymupdf.Matrix(zoom_factor, zoom_factor)  # Set zoom matrix
+
+    bbox = page.rect
+    header_bbox = (bbox.x0, bbox.y0, bbox.x1, bbox.y1 * 0.1)
+    footer_bbox = (bbox.x0, bbox.y1 * 0.9, bbox.x1, bbox.y1)
     pix = page.get_pixmap(matrix=mat)  # Apply zoom
+    header_pix = page.get_pixmap(matrix=mat, clip=header_bbox)
+    footer_pix = page.get_pixmap(matrix=mat, clip=footer_bbox)
 
     image_id = f"{source}_{num_page + 1}_image.png"
-    page_image_path = os.path.join(dir_name, image_id)
-    await asyncio.to_thread(pix.save, page_image_path)
-
+    image_path = os.path.join(dir_name, image_id)
+    await asyncio.to_thread(pix.save, image_path)
+    await asyncio.to_thread(header_pix.save, image_path.replace(".png", "_header.png"))
+    await asyncio.to_thread(footer_pix.save, image_path.replace(".png", "_footer.png"))
     return image_id
 
 
@@ -336,10 +342,10 @@ async def add_pdf_text_from_image_data(
         image_path = await save_page_image(page, num_page, source, IMAGE_DIR)
         text = await chat_image_retry(
             client,
-            text="画像には何が書かれていますか？画像に含まれるテキストをすべて書き出してください。\n\n画像に含まれるテキストは以下の通りです。\n",
-            image_paths=[image_path],
+            text="画像には何が書かれていますか？ヘッダー、本文、フッター画像に含まれるテキストをすべて書き出してください。\n\n画像に含まれるテキストは以下の通りです。\n",
+            image_paths=[image_path, image_path.replace(".png", "_header.png"), image_path.replace(".png", "_footer.png")],
             dir_name=IMAGE_DIR,
-            system_prompt="画像には何が書かれていますか？画像に含まれるテキストをすべて書き出してください。",
+            system_prompt="あなたはOCRです。画像に含まれるテキストを、ヘッダー・フッター含めて漏れなくすべて書き出してください。",
         )
         return {
             "id": f"{source}_{num_page + 1}",
