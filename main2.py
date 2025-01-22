@@ -104,7 +104,6 @@ SOURCE_LIST = {
 }
 
 COLLECTION_MAP = {}
-TABLE_COLLECTION_MAP = {}
 
 REPHRASE_PROMPT = """
     Compose Args for hybrid search, this function performs a hybrid search by combining vector similarity and keyword-based filtering
@@ -225,22 +224,13 @@ def create_collection_map(client):
         COLLECTION_MAP["COMPANY_INFORMATION"] = client.create_collection(
             name="COMPANY_INFORMATION", embedding_function=emb_fn
         )
-        TABLE_COLLECTION_MAP["COMPANY_INFORMATION"] = client.create_collection(
-            name="COMPANY_INFORMATION_TABLE", embedding_function=emb_fn
-        )
     if SOURCE_LIST["PRODUCT_INFORMATION"]:
         COLLECTION_MAP["PRODUCT_INFORMATION"] = client.create_collection(
             name="PRODUCT_INFORMATION", embedding_function=emb_fn
         )
-        TABLE_COLLECTION_MAP["PRODUCT_INFORMATION"] = client.create_collection(
-            name="PRODUCT_INFORMATION_TABLE", embedding_function=emb_fn
-        )
     if SOURCE_LIST["RESEARCH_INFORMATION"]:
         COLLECTION_MAP["RESEARCH_INFORMATION"] = client.create_collection(
             name="RESEARCH_INFORMATION", embedding_function=emb_fn
-        )
-        TABLE_COLLECTION_MAP["RESEARCH_INFORMATION"] = client.create_collection(
-            name="RESEARCH_INFORMATION_TABLE", embedding_function=emb_fn
         )
 
 
@@ -332,7 +322,11 @@ async def add_pdf_text_from_image_data(
         text = await chat_image_retry(
             client,
             text="画像には何が書かれていますか？ヘッダー、本文、フッター画像に含まれるテキストをすべて書き出してください。\n\n画像に含まれるテキストは以下の通りです。\n",
-            image_paths=[image_path, image_path.replace(".png", "_header.png"), image_path.replace(".png", "_footer.png")],
+            image_paths=[
+                image_path,
+                image_path.replace(".png", "_header.png"),
+                image_path.replace(".png", "_footer.png"),
+            ],
             dir_name=IMAGE_DIR,
             system_prompt="あなたはOCRです。画像に含まれるテキストを、ヘッダー・フッター含めて漏れなくすべて書き出してください。",
         )
@@ -365,108 +359,6 @@ async def add_pdf_text_from_image_data(
         await process_batch(batch)
 
 
-async def add_pdf_table_data(
-    doc: pymupdf.Document, source: str, collection_name: DocumentCategory, batch_size: int = 10
-):
-    collection = TABLE_COLLECTION_MAP[collection_name]
-
-    async def extract_page_tables(num_page, page):
-        tables = await save_table(page, source, num_page)
-
-        return [
-            {
-                "id": table.table_name,
-                "text": f"table caption: {table.caption}\n\nschema: {table.table_schema}",
-                "metadata": {"source": table.source, "page": num_page + 1},
-            }
-            for table in tables
-        ]
-
-    async def process_batch(batch):
-        ids, texts, metadatas = [], [], []
-
-        for num_page, page in batch:
-            page_datas = await extract_page_tables(num_page, page)
-            for page_data in page_datas:
-                ids.append(page_data["id"])
-                texts.append(page_data["text"])
-                metadatas.append(page_data["metadata"])
-
-        if ids and texts and metadatas:
-            await asyncio.to_thread(collection.add, documents=texts, metadatas=metadatas, ids=ids)
-
-    batch = []
-    for num_page, page in enumerate(doc):
-        batch.append((num_page, page))
-
-        if len(batch) == batch_size:
-            await process_batch(batch)
-            batch = []
-
-    if batch:
-        await process_batch(batch)
-
-
-def get_caption_text(page: pymupdf.Page, table_bbox, margin=20):
-    """
-    テーブル上下のキャプションを取得する
-    table_bbox: (x0, y0, x1, y1) テーブル全体の座標 左上が原点（x0,y0）
-    """
-    x0, y0, x1, y1 = table_bbox
-    top_box = (x0, y0 - margin, x1, y0)
-    top_text = page.get_textbox(top_box)
-    bottom_box = (x0, y1, x1, y1 + margin)
-    bottom_text = page.get_textbox(bottom_box)
-    return top_text.strip(), bottom_text.strip()
-
-
-async def save_table(
-    page: pymupdf.Page, source: str, num_page: int
-) -> tuple[list[Table], list[str]]:
-    tables = page.find_tables(strategy="lines_strict").tables
-
-    table_datas = []
-    if tables:
-        for index, table in enumerate(tables):
-            # table caption
-            bbox = table.bbox
-            caption = None
-            if bbox:
-                top_caption, bottom_caption = get_caption_text(page, bbox, margin=20)
-                caption = f"{top_caption}\n\n{bottom_caption}"
-
-            # table dataframe
-            df = table.to_pandas()
-            if table.header.external:  # ヘッダーが表の外部の場合、一行目をヘッダーに置き換える
-                new_header = df.iloc[0]
-                df = df[1:]
-                df.columns = new_header
-                df.reset_index(drop=True, inplace=True)
-
-            if all(
-                col is not None and col.startswith("Col") for col in df.columns
-            ):  # ヘッダーがすべてデフォルト列名の場合、保存しない
-                continue
-
-            # テーブルはsqliteに保存せず、スクショする
-            table_id = f"{source}_{num_page}_{index}"
-            await save_table_image(page, table_id, TABLE_IMAGE_DIR, bbox)
-
-            # table schema
-            table_schema = {"columns": df.columns.tolist(), "index": df.iloc[:, 0].tolist()}
-
-            table_data = Table(
-                table_name=table_id,
-                caption=caption,
-                table_schema=json.dumps(table_schema, ensure_ascii=False, indent=2),
-                source=source,
-                page=num_page,
-            )
-            table_datas.append(table_data)
-
-    return table_datas
-
-
 async def load_pdf(info: DocumentInfo):
     pdf_path = info.path
     source = info.source
@@ -478,10 +370,8 @@ async def load_pdf(info: DocumentInfo):
     with pymupdf.open(pdf_path) as doc:
         if info.is_valid:
             await add_pdf_text_data(doc, source, collection_name)
-            await add_pdf_table_data(doc, source, collection_name)
         else:
             await add_pdf_text_from_image_data(doc, source, collection_name)
-            await add_pdf_table_data(doc, source, collection_name)
 
 
 async def build_collection():
@@ -598,20 +488,6 @@ def hybrid_search(
     return documents
 
 
-def hybrid_search_table(
-    collection_name: str,
-    vector_query_text: str,
-    query_keyword: str = None,
-    source: str = None,
-    top_k: int = 5,
-) -> list[str]:
-    collection = TABLE_COLLECTION_MAP[collection_name]
-    results = hybrid_search_base(collection, vector_query_text, query_keyword, source, top_k)
-    if not results:
-        return []
-    return results.get("ids", [])[0]
-
-
 def rephrase_query(query: str) -> QueryArgs:
     rephrase_prompt = REPHRASE_PROMPT.format(SOURCE_LIST_STR)
     llm = ChatOpenAI(model=model, temperature=0.3)
@@ -682,17 +558,10 @@ def deduplicate_documents(retrieval_texts_list: list[list[PageDocument]]) -> str
 
 async def query(client: AsyncOpenAI, question: str, query_args: list[QueryArg]):
     retrieval_texts_list = []
-    retrieval_tables_list = []
     for query_arg in query_args:
         retrieval_texts_list.append(hybrid_search(**query_arg.model_dump()))
-        retrieval_tables_list.append(hybrid_search_table(**query_arg.model_dump()))
 
     retrieval_texts = deduplicate_documents(retrieval_texts_list)
-    retrieval_tables = []
-    for table in retrieval_tables_list:
-        retrieval_tables.extend(table)
-    table_names = list(set(retrieval_tables))
-    table_image_paths = [f"{name}.png" for name in table_names]
 
     # 検索結果が得られなかった場合、メタデータフィルターを排除して再検索
     if not retrieval_texts:
@@ -701,11 +570,7 @@ async def query(client: AsyncOpenAI, question: str, query_args: list[QueryArg]):
         )
         retrieval_texts = deduplicate_documents(retrieval_texts_list)
     text_response = await chat(client, question, retrieval_texts)
-    is_answerable = await eval(client, question, text_response)
-    if not is_answerable:
-        return await chat_image(client, question, table_image_paths, TABLE_IMAGE_DIR)
-    else:
-        return text_response
+    return text_response
 
 
 def rag_implementation(question: str) -> str:
