@@ -216,17 +216,6 @@ def update_source_list_str():
 
 
 # Create Chroma Collection
-# Create MultiModal Collection  # 律速
-async def create_multimodal_collection(client, collection_name: str):
-    collection = client.create_collection(
-        name=collection_name + "_IMAGE",
-        embedding_function=OpenCLIPEmbeddingFunction(),
-        data_loader=ImageLoader(),
-    )
-    return collection
-
-
-# Create Collection
 def create_collection_map(client):
     emb_fn = embedding_functions.OpenAIEmbeddingFunction(
         model_name="text-embedding-3-small", api_key=os.environ["OPENAI_API_KEY"]
