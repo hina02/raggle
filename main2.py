@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 from langchain import callbacks
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
-from openai import OpenAI
+from openai import AsyncOpenAI
 from pydantic import BaseModel
 
 import chromadb
@@ -105,7 +105,6 @@ SOURCE_LIST = {
 }
 
 COLLECTION_MAP = {}
-IMAGE_COLLECTION_MAP = {}
 TABLE_COLLECTION_MAP = {}
 
 REPHRASE_PROMPT = """
@@ -257,36 +256,17 @@ def create_collection_map(client):
         )
 
 
-async def create_image_collection_map(client):
-    if not is_valid_source_collection(SOURCE_LIST["COMPANY_INFORMATION"]):
-        company_image_collection = await create_multimodal_collection(client, "COMPANY_INFORMATION")
-        IMAGE_COLLECTION_MAP["COMPANY_INFORMATION"] = company_image_collection
-    if not is_valid_source_collection(SOURCE_LIST["PRODUCT_INFORMATION"]):
-        product_image_collection = await create_multimodal_collection(client, "PRODUCT_INFORMATION")
-        IMAGE_COLLECTION_MAP["PRODUCT_INFORMATION"] = product_image_collection
-    if not is_valid_source_collection(SOURCE_LIST["RESEARCH_INFORMATION"]):
-        research_image_collection = await create_multimodal_collection(
-            client, "RESEARCH_INFORMATION"
-        )
-        IMAGE_COLLECTION_MAP["RESEARCH_INFORMATION"] = research_image_collection
-
-
 # Extract PDF
-async def save_page_image(
-    page: pymupdf.Page, num_page: int, source: str, dir_name: str
-) -> tuple[str, np.ndarray]:
+async def save_page_image(page: pymupdf.Page, num_page: int, source: str, dir_name: str) -> str:
     zoom_factor = 2.0
     mat = pymupdf.Matrix(zoom_factor, zoom_factor)  # Set zoom matrix
     pix = page.get_pixmap(matrix=mat)  # Apply zoom
 
-    image_id = f"{source}_{num_page + 1}_image"
-    page_image_path = os.path.join(dir_name, f"{image_id}.png")
+    image_id = f"{source}_{num_page + 1}_image.png"
+    page_image_path = os.path.join(dir_name, image_id)
     await asyncio.to_thread(pix.save, page_image_path)
 
-    image_data = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
-        pix.h, pix.w, pix.n
-    )  # np.array(img)と一致を確認済み
-    return image_id, image_data
+    return image_id
 
 
 async def save_table_image(
@@ -306,33 +286,6 @@ async def save_table_image(
 
     except Exception:
         pass
-
-
-async def add_pdf_image_data(
-    doc: pymupdf.Document, source: str, collection_name: str, batch_size: int = 10
-):
-    image_collection = IMAGE_COLLECTION_MAP[collection_name]
-
-    async def process_batch(batch):
-        ids = []
-        images = []
-
-        for num_page, page in batch:
-            page_id, image_data = await save_page_image(page, num_page, source, IMAGE_DIR)
-            ids.append(page_id)
-            images.append(image_data)
-
-        await asyncio.to_thread(image_collection.add, ids=ids, images=images)
-
-    batch = []
-    for num_page, page in enumerate(doc):
-        batch.append((num_page, page))
-        if len(batch) == batch_size:
-            await process_batch(batch)
-            batch = []
-
-    if batch:
-        await process_batch(batch)
 
 
 async def add_pdf_text_data(
@@ -355,6 +308,50 @@ async def add_pdf_text_data(
 
         for num_page, page in batch:
             page_data = await extract_page_text(num_page, page)
+            ids.append(page_data["id"])
+            texts.append(page_data["text"])
+            metadatas.append(page_data["metadata"])
+
+        await asyncio.to_thread(collection.add, documents=texts, metadatas=metadatas, ids=ids)
+
+    batch = []
+    for num_page, page in enumerate(doc):
+        batch.append((num_page, page))
+
+        if len(batch) == batch_size:
+            await process_batch(batch)
+            batch = []
+
+    if batch:
+        await process_batch(batch)
+
+
+async def add_pdf_text_from_image_data(
+    doc: pymupdf.Document, source: str, collection_name: str, batch_size: int = 10
+):
+    collection = COLLECTION_MAP[collection_name]
+    client = AsyncOpenAI()
+
+    async def extract_page_text_from_image(num_page, page):
+        image_path = await save_page_image(page, num_page, source, IMAGE_DIR)
+        text = await chat_image_retry(
+            client,
+            text="画像には何が書かれていますか？画像に含まれるテキストをすべて書き出してください。\n\n画像に含まれるテキストは以下の通りです。\n",
+            image_paths=[image_path],
+            dir_name=IMAGE_DIR,
+            system_prompt="画像には何が書かれていますか？画像に含まれるテキストをすべて書き出してください。",
+        )
+        return {
+            "id": f"{source}_{num_page + 1}",
+            "text": text,
+            "metadata": {"source": source, "page": num_page + 1},
+        }
+
+    async def process_batch(batch):
+        ids, texts, metadatas = [], [], []
+
+        tasks = [extract_page_text_from_image(num_page, page) for num_page, page in batch]
+        for page_data in await asyncio.gather(*tasks):
             ids.append(page_data["id"])
             texts.append(page_data["text"])
             metadatas.append(page_data["metadata"])
@@ -484,10 +481,12 @@ async def load_pdf(info: DocumentInfo):
     source = file_name.split(".")[0]
 
     with pymupdf.open(pdf_path) as doc:
-        if not info.is_valid:
-            await add_pdf_image_data(doc, source, collection_name)
-        await add_pdf_text_data(doc, source, collection_name)
-        await add_pdf_table_data(doc, source, collection_name)
+        if info.is_valid:
+            await add_pdf_text_data(doc, source, collection_name)
+            await add_pdf_table_data(doc, source, collection_name)
+        else:
+            await add_pdf_text_from_image_data(doc, source, collection_name)
+            await add_pdf_table_data(doc, source, collection_name)
 
 
 async def build_collection():
@@ -502,7 +501,6 @@ async def build_collection():
     # create collection
     client = chromadb.Client()
     create_collection_map(client)
-    await create_image_collection_map(client)
 
     # add pdf data to chroma
     tasks = [load_pdf(info) for info in document_infos]
@@ -519,8 +517,13 @@ def encode_image(image_path: str, dir_name: str):
         return base64.b64encode(image_file.read()).decode("utf-8")
 
 
-def chat_image(client: OpenAI, text: str, image_paths: list[str], dir_name: str = IMAGE_DIR) -> str:
-    messages = [{"role": "user", "content": [{"type": "text", "text": text}]}]
+async def chat_image(
+    client: AsyncOpenAI, text: str, image_paths: list[str], dir_name: str, system_prompt: str = None
+) -> str:
+
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": text}]},
+    ]
 
     for image_path in image_paths:
         base64_image = encode_image(image_path, dir_name)
@@ -530,7 +533,10 @@ def chat_image(client: OpenAI, text: str, image_paths: list[str], dir_name: str 
         }
         messages[0]["content"].append(image_message)
 
-    response = client.chat.completions.create(
+    if system_prompt:
+        messages.insert(0, {"role": "system", "content": system_prompt})
+
+    response = await client.chat.completions.create(
         model=model,
         temperature=0.3,
         messages=messages,
@@ -539,11 +545,17 @@ def chat_image(client: OpenAI, text: str, image_paths: list[str], dir_name: str 
     return response.choices[0].message.content
 
 
-def query_image_collection(collection_name: str, query_text: str, top_k=4):
-    image_collection = IMAGE_COLLECTION_MAP[collection_name]
-    image_results = image_collection.query(query_texts=[query_text], n_results=top_k)
-    image_paths = image_results.get("ids")[0]
-    return [image_path + ".png" for image_path in image_paths]
+async def chat_image_retry(
+    client: AsyncOpenAI, text: str, image_paths: list[str], dir_name: str, system_prompt: str = None
+) -> str:
+    count = 0
+    max_retry = 2
+    while count < max_retry:
+        response = await chat_image(client, text, image_paths, dir_name, system_prompt)
+        if len(response) > 100:
+            return response
+        count += 1
+    return response
 
 
 def hybrid_search_base(
@@ -619,7 +631,7 @@ def rephrase_query(query: str) -> QueryArgs:
     return structured_llm.invoke(query)
 
 
-def chat(client: OpenAI, text: str, retrieval_text: str) -> str:
+async def chat(client: AsyncOpenAI, text: str, retrieval_text: str) -> str:
     messages = [
         {
             "role": "system",
@@ -627,7 +639,7 @@ def chat(client: OpenAI, text: str, retrieval_text: str) -> str:
         },
         {"role": "user", "content": text},
     ]
-    response = client.chat.completions.create(
+    response = await client.chat.completions.create(
         model=model,
         temperature=0.3,
         messages=messages,
@@ -636,7 +648,7 @@ def chat(client: OpenAI, text: str, retrieval_text: str) -> str:
     return response.choices[0].message.content
 
 
-def eval(client: OpenAI, query: str, answer: str) -> bool:
+async def eval(client: AsyncOpenAI, query: str, answer: str) -> bool:
     messages = [
         {
             "role": "system",
@@ -649,7 +661,7 @@ def eval(client: OpenAI, query: str, answer: str) -> bool:
         },
         {"role": "assistant", "content": f"質問: {query}\n\n回答: {answer}"},
     ]
-    response = client.beta.chat.completions.parse(
+    response = await client.beta.chat.completions.parse(
         model="gpt-4o-mini",
         temperature=0.3,
         messages=messages,
@@ -673,7 +685,7 @@ def deduplicate_documents(retrieval_texts_list: list[list[PageDocument]]) -> str
     return combined_text
 
 
-def query(client: OpenAI, question: str, query_args: list[QueryArg]):
+async def query(client: AsyncOpenAI, question: str, query_args: list[QueryArg]):
     retrieval_texts_list = []
     retrieval_tables_list = []
     for query_arg in query_args:
@@ -687,28 +699,16 @@ def query(client: OpenAI, question: str, query_args: list[QueryArg]):
     table_names = list(set(retrieval_tables))
     table_image_paths = [f"{name}.png" for name in table_names]
 
-    # 検索結果が得られなかった場合、画像検索
+    # 検索結果が得られなかった場合、メタデータフィルターを排除して再検索
     if not retrieval_texts:
-        image_paths = []
-        if IMAGE_COLLECTION_MAP.get(query_args[0].collection_name):
-            image_paths = query_image_collection(
-                query_args[0].collection_name, query_args[0].vector_query_text
-            )
-
-        if image_paths:
-            image_response = chat_image(client, question, image_paths, IMAGE_DIR)
-            return image_response
-
-        # 画像コレクションがなく、検索結果が得られなかった場合、メタデータフィルターを排除して再検索
-        else:
-            retrieval_texts = hybrid_search(
-                query_args[0].collection_name, query_args[0].vector_query_text
-            )
-            retrieval_texts = deduplicate_documents(retrieval_texts_list)
-    text_response = chat(client, question, retrieval_texts)
-    is_answerable = eval(client, question, text_response)
+        retrieval_texts = hybrid_search(
+            query_args[0].collection_name, query_args[0].vector_query_text
+        )
+        retrieval_texts = deduplicate_documents(retrieval_texts_list)
+    text_response = await chat(client, question, retrieval_texts)
+    is_answerable = await eval(client, question, text_response)
     if not is_answerable:
-        return chat_image(client, question, table_image_paths, TABLE_IMAGE_DIR)
+        return await chat_image(client, question, table_image_paths, TABLE_IMAGE_DIR)
     else:
         return text_response
 
@@ -733,10 +733,10 @@ def rag_implementation(question: str) -> str:
     asyncio.run(build_collection())
 
     # query
-    client = OpenAI()
+    client = AsyncOpenAI()
     response = rephrase_query(question)
     query_args = response.args
-    response = query(client, question, query_args)
+    response = asyncio.run(query(client, question, query_args))
 
     # 戻り値として質問に対する回答を返却してください。
     answer = response
